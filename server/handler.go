@@ -1005,8 +1005,30 @@ func (h *jobsInsertHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	server := serverFromContext(ctx)
 	project := projectFromContext(ctx)
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		errorResponse(ctx, w, errInternalError(err.Error()))
+		return
+	}
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err == nil {
+		if config, ok := raw["configuration"].(map[string]interface{}); ok {
+			if val, ok := config["jobTimeoutMs"]; ok {
+				switch v := val.(type) {
+				case float64:
+					config["jobTimeoutMs"] = strconv.FormatInt(int64(v), 10)
+				case json.Number:
+					config["jobTimeoutMs"] = v.String()
+				}
+			}
+		}
+		if b, err := json.Marshal(raw); err == nil {
+			body = b
+		}
+	}
+
 	var job bigqueryv2.Job
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+	if err := json.Unmarshal(body, &job); err != nil {
 		errorResponse(ctx, w, errInvalid(err.Error()))
 		return
 	}
@@ -1411,6 +1433,11 @@ func (h *jobsInsertHandler) Handle(ctx context.Context, r *jobsInsertRequest) (*
 		job.Configuration.Query.QueryParameters,
 	)
 	endTime := time.Now()
+	if job.JobReference == nil {
+		job.JobReference = &bigqueryv2.JobReference{
+			ProjectId: r.project.ID,
+		}
+	}
 	if job.JobReference.JobId == "" {
 		job.JobReference.JobId = randomID() // generate job id
 	}
