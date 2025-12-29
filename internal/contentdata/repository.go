@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	"github.com/goccy/go-zetasqlite"
-	"github.com/mattn/go-sqlite3"
 	"go.uber.org/zap"
 	bigqueryv2 "google.golang.org/api/bigquery/v2"
 
@@ -51,35 +50,7 @@ func (r *Repository) getConnection(ctx context.Context, projectID, datasetID str
 		zetasqliteConn.SetMaxNamePath(maxNamePath)
 		return nil
 	}); err != nil {
-		return nil, err
-	}
-
-	// Register SEARCH function on the underlying sqlite3 connection
-	if err := conn.Raw(func(c interface{}) error {
-		sqliteConn, ok := c.(*sqlite3.SQLiteConn)
-		if !ok {
-			return fmt.Errorf("failed to get SQLiteConn from %T", c)
-		}
-		// Register SEARCH function
-		if err := sqliteConn.RegisterFunc("SEARCH", searchFunc, true); err != nil {
-			return fmt.Errorf("failed to register SEARCH function: %w", err)
-		}
-		return nil
-	}); err != nil {
-		return nil, err
-	}
-
-	// Also create the SEARCH function in ZetaSQL catalog
-	// This is needed because zetasqlite analyzes the query before executing it
-	createFuncSQL := `
-CREATE OR REPLACE FUNCTION SEARCH(search_query STRING, search_text STRING)
-RETURNS BOOL
-AS (
-  -- This will be handled by the SQLite UDF
-  CAST(NULL AS BOOL)
-)`
-	if _, err := conn.ExecContext(ctx, createFuncSQL); err != nil {
-		return nil, fmt.Errorf("failed to create SEARCH function in catalog: %w", err)
+		return nil, fmt.Errorf("failed to setup connection: %w", err)
 	}
 	return conn, nil
 }
@@ -94,42 +65,6 @@ func (r *Repository) tablePath(projectID, datasetID, tableID string) string {
 	}
 	tablePath = append(tablePath, tableID)
 	return strings.Join(tablePath, ".")
-}
-
-// searchFunc implements the BigQuery SEARCH function
-// SEARCH(search_query, search_text[, language => language_code])
-// Returns TRUE if search_query is found in search_text, FALSE otherwise
-func searchFunc(searchQuery, searchText interface{}) (bool, error) {
-	query, ok := searchQuery.(string)
-	if !ok {
-		return false, fmt.Errorf("SEARCH: search_query must be a string")
-	}
-	text, ok := searchText.(string)
-	if !ok {
-		return false, fmt.Errorf("SEARCH: search_text must be a string")
-	}
-
-	// For now, implement basic substring search
-	// TODO: Implement more advanced search with language support
-	return strings.Contains(text, query), nil
-}
-
-// transformSearchFunctions transforms SEARCH function calls to SQLite-compatible expressions
-func (r *Repository) transformSearchFunctions(query string) string {
-	// Regex to match SEARCH function calls: SEARCH(search_query, search_text)
-	// This handles basic cases but may need enhancement for complex expressions
-	re := regexp.MustCompile(`\bSEARCH\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)`)
-	return re.ReplaceAllStringFunc(query, func(match string) string {
-		parts := re.FindStringSubmatch(match)
-		if len(parts) != 3 {
-			return match // Return original if parsing fails
-		}
-		searchQuery := strings.TrimSpace(parts[1])
-		searchText := strings.TrimSpace(parts[2])
-		// Transform to ZetaSQL INSTR function: INSTR(text, query, 1, 1) > 0
-		// INSTR(source, search, position, occurrence) returns position of occurrence
-		return fmt.Sprintf("INSTR(%s, %s, 1, 1) > 0", searchText, searchQuery)
-	})
 }
 
 func (r *Repository) routinePath(projectID, datasetID, routineID string) string {
@@ -234,8 +169,7 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 	fields := []*bigqueryv2.TableFieldSchema{}
 	logger.Logger(ctx).Info(
 		"",
-		zap.String("original_query", query),
-		zap.String("transformed_query", query),
+		zap.String("query", query),
 		zap.Any("values", values),
 	)
 	rows, err := tx.Tx().QueryContext(ctx, query, values...)
@@ -587,4 +521,47 @@ func (r *Repository) AddRoutineByMetaData(ctx context.Context, tx *connection.Tx
 		return fmt.Errorf("failed to create function %s: %w", query, err)
 	}
 	return nil
+}
+
+// searchFunc implements the BigQuery SEARCH function
+// SEARCH(search_query, search_text[, language => language_code])
+// Returns TRUE if search_query is found in search_text, FALSE otherwise
+func searchFunc(searchQuery, searchText interface{}) (bool, error) {
+	query, ok := searchQuery.(string)
+	if !ok {
+		return false, fmt.Errorf("SEARCH: search_query must be a string")
+	}
+	text, ok := searchText.(string)
+	if !ok {
+		return false, fmt.Errorf("SEARCH: search_text must be a string")
+	}
+
+	// For now, implement basic substring search
+	// TODO: Implement more advanced search with language support
+	return strings.Contains(text, query), nil
+}
+
+// transformSearchFunctions transforms SEARCH function calls to SQLite-compatible expressions
+func (r *Repository) transformSearchFunctions(query string) string {
+	// Only transform if SEARCH is present
+	if !strings.Contains(query, "SEARCH") {
+		return query
+	}
+
+	// Regex to match SEARCH function calls: SEARCH(search_query, search_text)
+	// This handles basic cases but may need enhancement for complex expressions
+	re := regexp.MustCompile(`\bSEARCH\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)`)
+	transformed := re.ReplaceAllStringFunc(query, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match // Return original if parsing fails
+		}
+		searchQuery := strings.TrimSpace(parts[1])
+		searchText := strings.TrimSpace(parts[2])
+		// Transform to ZetaSQL INSTR function: INSTR(text, query, 1, 1) > 0
+		// INSTR(source, search, position, occurrence) returns position of occurrence
+		return fmt.Sprintf("INSTR(%s, %s, 1, 1) > 0", searchText, searchQuery)
+	})
+
+	return transformed
 }
