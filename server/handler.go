@@ -1006,7 +1006,7 @@ func (h *jobsInsertHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	server := serverFromContext(ctx)
 	project := projectFromContext(ctx)
 	var job bigqueryv2.Job
-	if err := json.NewDecoder(r.Body).Decode(&job); err != nil {
+	if err := decodeJobAllowingNumericJobTimeout(r, &job); err != nil {
 		errorResponse(ctx, w, errInvalid(err.Error()))
 		return
 	}
@@ -1026,6 +1026,44 @@ type jobsInsertRequest struct {
 	server  *Server
 	project *metadata.Project
 	job     *bigqueryv2.Job
+}
+
+// decodeJobAllowingNumericJobTimeout decodes a job request while tolerating jobTimeoutMs
+// being sent either as a JSON string (the official API shape) or as a number (common in some SDKs).
+// The google api struct uses `,string` tag, so a numeric value would normally cause an error.
+func decodeJobAllowingNumericJobTimeout(r *http.Request, job *bigqueryv2.Job) error {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	// Restore body for any potential later readers.
+	r.Body = io.NopCloser(bytes.NewReader(body))
+
+	// First attempt: strict unmarshal (accepts the official string format).
+	if err := json.Unmarshal(body, job); err == nil {
+		return nil
+	}
+
+	// Second attempt: coerce numeric jobTimeoutMs into string then unmarshal.
+	var raw map[string]interface{}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return err
+	}
+	if cfg, ok := raw["configuration"].(map[string]interface{}); ok {
+		if v, ok := cfg["jobTimeoutMs"]; ok {
+			switch t := v.(type) {
+			case float64:
+				cfg["jobTimeoutMs"] = fmt.Sprintf("%.0f", t)
+			case json.Number:
+				cfg["jobTimeoutMs"] = t.String()
+			}
+		}
+	}
+	coerced, err := json.Marshal(raw)
+	if err != nil {
+		return err
+	}
+	return json.Unmarshal(coerced, job)
 }
 
 func (h *jobsInsertHandler) tableDefFromQueryResponse(tableID string, response *internaltypes.QueryResponse) (*types.Table, error) {
