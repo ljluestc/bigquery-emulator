@@ -164,7 +164,9 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 		}
 	}
 	// Transform SEARCH function calls to SQLite-compatible expressions
-	query = r.transformSearchFunctions(query)
+	if strings.Contains(query, "SEARCH") {
+		query = r.transformSearchFunctions(query)
+	}
 
 	fields := []*bigqueryv2.TableFieldSchema{}
 	logger.Logger(ctx).Info(

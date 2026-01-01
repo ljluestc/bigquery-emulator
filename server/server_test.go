@@ -1373,11 +1373,10 @@ func TestContentEncoding(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
-	defer writer.Close()
 	if _, err := writer.Write(b); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.Flush(); err != nil {
+	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/projects/test/jobs", testServer.URL), &buf)
