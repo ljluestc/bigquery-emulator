@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"fmt"
 	"reflect"
+	"regexp"
 	"strings"
 
 	"github.com/goccy/go-zetasqlite"
@@ -162,6 +163,11 @@ func (r *Repository) Query(ctx context.Context, tx *connection.Tx, projectID, da
 			values = append(values, value)
 		}
 	}
+	// Transform SEARCH function calls to SQLite-compatible expressions
+	if strings.Contains(query, "SEARCH") {
+		query = r.transformSearchFunctions(query)
+	}
+
 	fields := []*bigqueryv2.TableFieldSchema{}
 	logger.Logger(ctx).Info(
 		"",
@@ -517,4 +523,47 @@ func (r *Repository) AddRoutineByMetaData(ctx context.Context, tx *connection.Tx
 		return fmt.Errorf("failed to create function %s: %w", query, err)
 	}
 	return nil
+}
+
+// searchFunc implements the BigQuery SEARCH function
+// SEARCH(search_query, search_text[, language => language_code])
+// Returns TRUE if search_query is found in search_text, FALSE otherwise
+func searchFunc(searchQuery, searchText interface{}) (bool, error) {
+	query, ok := searchQuery.(string)
+	if !ok {
+		return false, fmt.Errorf("SEARCH: search_query must be a string")
+	}
+	text, ok := searchText.(string)
+	if !ok {
+		return false, fmt.Errorf("SEARCH: search_text must be a string")
+	}
+
+	// For now, implement basic substring search
+	// TODO: Implement more advanced search with language support
+	return strings.Contains(text, query), nil
+}
+
+// transformSearchFunctions transforms SEARCH function calls to SQLite-compatible expressions
+func (r *Repository) transformSearchFunctions(query string) string {
+	// Only transform if SEARCH is present
+	if !strings.Contains(query, "SEARCH") {
+		return query
+	}
+
+	// Regex to match SEARCH function calls: SEARCH(search_query, search_text)
+	// This handles basic cases but may need enhancement for complex expressions
+	re := regexp.MustCompile(`\bSEARCH\s*\(\s*([^,()]+)\s*,\s*([^,()]+)\s*\)`)
+	transformed := re.ReplaceAllStringFunc(query, func(match string) string {
+		parts := re.FindStringSubmatch(match)
+		if len(parts) != 3 {
+			return match // Return original if parsing fails
+		}
+		searchQuery := strings.TrimSpace(parts[1])
+		searchText := strings.TrimSpace(parts[2])
+		// Transform to ZetaSQL INSTR function: INSTR(text, query, 1, 1) > 0
+		// INSTR(source, search, position, occurrence) returns position of occurrence
+		return fmt.Sprintf("INSTR(%s, %s, 1, 1) > 0", searchText, searchQuery)
+	})
+
+	return transformed
 }

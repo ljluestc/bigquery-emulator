@@ -1373,11 +1373,10 @@ func TestContentEncoding(t *testing.T) {
 	}
 	var buf bytes.Buffer
 	writer := gzip.NewWriter(&buf)
-	defer writer.Close()
 	if _, err := writer.Write(b); err != nil {
 		t.Fatal(err)
 	}
-	if err := writer.Flush(); err != nil {
+	if err := writer.Close(); err != nil {
 		t.Fatal(err)
 	}
 	req, err := http.NewRequest("POST", fmt.Sprintf("%s/projects/test/jobs", testServer.URL), &buf)
@@ -2709,4 +2708,139 @@ func TestInformationSchema(t *testing.T) {
 		}
 	})
 
+}
+
+func TestSearchFunction(t *testing.T) {
+	ctx := context.Background()
+
+	bqServer, err := server.New(server.TempStorage)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bqServer.Load(
+		server.StructSource(
+			types.NewProject(
+				"test",
+				types.NewDataset(
+					"dataset1",
+					types.NewTable(
+						"table_a",
+						[]*types.Column{
+							types.NewColumn("id", types.INTEGER),
+							types.NewColumn("text_content", types.STRING),
+						},
+						types.Data{
+							{
+								"id":           1,
+								"text_content": "The quick brown fox jumps over the lazy dog",
+							},
+							{
+								"id":           2,
+								"text_content": "BigQuery is a powerful data warehouse",
+							},
+							{
+								"id":           3,
+								"text_content": "Search functions help find text patterns",
+							},
+						},
+					),
+				),
+			),
+		),
+	); err != nil {
+		t.Fatal(err)
+	}
+	testServer := bqServer.TestServer()
+	defer func() {
+		testServer.Close()
+		bqServer.Close()
+	}()
+
+	client, err := bigquery.NewClient(
+		ctx,
+		"test",
+		option.WithEndpoint(testServer.URL),
+		option.WithoutAuthentication(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	t.Run("basic search", func(t *testing.T) {
+		query := client.Query("SELECT id, text_content, SEARCH('fox', text_content) as found FROM dataset1.table_a")
+		it, err := query.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for {
+			var row []bigquery.Value
+			if err := it.Next(&row); err != nil {
+				if err == iterator.Done {
+					break
+				}
+				t.Fatal(err)
+			}
+			t.Log("row = ", row)
+			if len(row) >= 3 {
+				// row[0] is id, row[2] is the SEARCH result
+				if row[0].(int64) == 1 && row[2].(bool) == true {
+					found = true
+				}
+			}
+		}
+		if !found {
+			t.Error("Expected to find 'fox' in the first row")
+		}
+	})
+
+	t.Run("search in WHERE clause", func(t *testing.T) {
+		query := client.Query("SELECT id, text_content FROM dataset1.table_a WHERE SEARCH('powerful', text_content)")
+		it, err := query.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		count := 0
+		for {
+			var row []bigquery.Value
+			if err := it.Next(&row); err != nil {
+				if err == iterator.Done {
+					break
+				}
+				t.Fatal(err)
+			}
+			t.Log("row = ", row)
+			count++
+		}
+		if count != 1 {
+			t.Errorf("Expected 1 row, got %d", count)
+		}
+	})
+
+	t.Run("search case sensitivity", func(t *testing.T) {
+		query := client.Query("SELECT id, SEARCH('FOX', text_content) as found FROM dataset1.table_a WHERE id = 1")
+		it, err := query.Read(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		found := false
+		for {
+			var row []bigquery.Value
+			if err := it.Next(&row); err != nil {
+				if err == iterator.Done {
+					break
+				}
+				t.Fatal(err)
+			}
+			t.Log("case sensitivity row = ", row)
+			// SEARCH should be case-sensitive, so 'FOX' should not match 'fox'
+			if len(row) >= 2 && row[1].(bool) == false {
+				found = true
+			}
+		}
+		if !found {
+			t.Error("Expected case-sensitive search to NOT find 'FOX' (uppercase) in text containing 'fox' (lowercase)")
+		}
+	})
 }
